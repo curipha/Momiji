@@ -1,178 +1,185 @@
 #!/usr/bin/env ruby
 
-require 'nokogiri'
 require 'net/http'
+require 'rubygems'
+require 'nokogiri'
 
-class Futaba
-  ENCODE = 'CP932'  # a.k.a Windows-31J. Not Shift_JIS.
+module Futaba
 
-  def initialize(server)
-    # Server host name
-    @server = server.downcase
+  class Base
+    attr_reader :server
 
-    # Nokogiri object
-    @noko = nil
-  end
-
-  def host()
-    return "#{@server}.2chan.net"
-  end
-  def thread(id)
-    return "/b/res/#{id}.htm"
-  end
-  def catalog()
-    return '/b/futaba.php?mode=cat'
-  end
-
-  def connect(addr, cookie = nil)
-    # Firefox29 on Linux x86
-    header = {
-      'User-Agent' => 'Mozilla/5.0 (X11; Linux i686; rv:29.0) Gecko/20100101 Firefox/29.0',
-      'Accept'     => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language' => 'en-US,en;q=0.5',
-      'Accept-Encoding' => 'gzip, deflate'
-    }
-    header['Cookie'] = cookie unless cookie.nil?
-
-    body = ''
-    Net::HTTP.start(host()) {|http|
-      http.request_get(addr, header) {|responce|
-        case responce
-        when Net::HTTPOK  # 200 OK
-          body = responce.body.strip
-        else
-          body = ''
-        end
-      }
-    }
-
-    return body
-  end
-
-  def parse_file(path, opt = {})
-    return File.readable?(path) \
-      ? parse(IO.read(path, { encoding: ENCODE }), opt) \
-      : []
-  end
-  def parse(str = '', opt = {})
-    # Override me!
-    return []
-  end
-
-  private
-  def getnoko(str)
-    return @noko if str.empty? && ! @noko.nil?
-
-    n = Nokogiri::HTML(str, nil, ENCODE) {|cfg| cfg.nonet }
-    @noko = n
-
-    return n
-  end
-end
-
-class FutabaCatalog < Futaba
-  # Option parameter (common)
-
-  # opt[:text]
-  #   if nil or not defined, 1's text will not shown.
-  #   if integer, it treats as text length
-  # opt[:img]
-  #   if nil or not defined, 1's image URI will not shown.
-  #   if 0, it displays as smallest size URI.
-  #   if 1-6, it displays as bigger size URI. (may only)
-
-  def getthreads(opt = {})
-    return parse(connect(catalog(), cookie(opt)), opt)
-  end
-
-  def cookie(opt = {})
-    text = opt[:text] || 0
-    c  = "cxyl=100x100x#{text}"
-
-    if @server == 'may'
-      size = opt[:img] || 0
-      c += "x0x#{size}"
+    def initialize(server)
+      @server = server.downcase
     end
 
-    return c
+    def host
+      return "#{@server}.2chan.net"
+    end
+    def port
+      return '80'
+    end
+    def path
+      return '/'
+    end
+
+    private
+
+    def connect
+      if @dom.nil?
+        header = {
+          'User-Agent' => 'Mozilla/5.0 (X11; Linux i686; rv:29.0) Gecko/20100101 Firefox/29.0', # Firefox29 on Linux x86
+          'Accept'     => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language' => 'en-US,en;q=0.5',
+        }
+        header['Cookie'] = cookie if self.class.private_method_defined?(:cookie)
+
+        Net::HTTP.start(host, port) {|http|
+          http.request_get(path, header) {|responce|
+            @dom = nokogiri(responce.body) if responce.code == '200'
+          }
+        }
+      end
+
+      return @dom
+    end
+
+    def nokogiri(str)
+      if str.is_a?(String) && !str.strip.empty?
+        return Nokogiri::HTML(str.encode(Encoding::UTF_8, Encoding::CP932)) {|config|
+          config.options = Nokogiri::XML::ParseOptions::STRICT | Nokogiri::XML::ParseOptions::NONET
+        }
+      else
+        return nil
+      end
+    end
   end
 
-  def parse(str = '', opt = {})
-    threads = []
+  class Catalog < Base
+    attr_accessor :text, :img
 
-    getnoko(str).xpath('//td').each {|td|
-      next unless td.xpath('a[1]/@href').to_s =~ %r!res/(\d+)\.html?!
+    def path
+      return URI::catalog
+    end
 
-      threads << {
-        thread: $1.to_i,
-        res:    td.xpath('font[@size="2"]/text()').to_s =~ %r!\(?(\d+)! ? $1.to_i : 0,
+    def getthreads
+      html = connect
 
-        img:    opt[:img]  ? td.xpath('a[1]/img[1]/@src').to_s.strip : '',
-        text:   opt[:text] ? td.xpath('small/text()').to_s.strip     : ''
+      threads = []
+      unless html.nil?
+        html.xpath('//td').each {|td|
+          next unless td.xpath('a[1]/@href').to_s =~ %r!res/(\d+)\.html?!
+
+          threads << Futaba::Thread.new(
+            @server,
+            $1.strip,
+            td.xpath('font[@size="2"]/text()').to_s =~ %r!\(?(\d+)! ? $1.to_i : 0,
+            @img  ? td.xpath('a[1]/img[1]/@src').to_s.strip : nil,
+            @text ? td.xpath('small/text()').to_s.strip     : nil
+          )
+        }
+      end
+
+      return threads
+    end
+
+    private
+
+    def cookie
+      c  = "cxyl=100x100x#{@text || 0}"
+      c += "x0x#{@img || 0}" if @server == 'may'
+
+      return c
+    end
+  end
+
+  class Thread < Base
+    attr_reader :id, :rescount, :catalogimg, :catalogtext
+
+    XPATH_IMG = 'a[contains(@href, "/b/src/")][./img]/@href'
+
+    def initialize(server, id, rescount = nil, catalogimg = nil, catalogtext = nil)
+      super(server)
+
+      @id = id
+
+      @rescount    = rescount
+      @catalogimg  = catalogimg
+      @catalogtext = catalogtext
+    end
+
+    def path
+      return URI::thread(@id)
+    end
+
+    def getall
+      return [ getfirst ] + getres
+    end
+
+    def getfirst
+      return parse_post(connect.xpath('//form[2]'))
+    end
+    def getres
+      res = []
+      connect.xpath('//td[@bgcolor="#F0E0D6"][@class="rtd"]').each {|post|
+        res << parse_post(post)
       }
-    }
+      @rescount = res.length
+      return res
+    end
 
-    return threads
+    def getimgs
+      return connect.xpath('//' + XPATH_IMG).to_a.map(&:to_s)
+    end
+
+    private
+
+    def parse_post(node)
+      txtnode = node.xpath('text()').to_s
+
+      return Futaba::Post.new(
+        no:      node.xpath('input[@value="delete"]/@name').to_s.to_i,
+        name:    node.xpath('font[@color="#117743"]/b/text()').to_s.strip,
+        email:   node.xpath('font[@color="#117743"]/b/a[starts-with(@href, "mailto:")]/@href').to_s.strip,
+        title:   node.xpath('font[@color="#cc1105"]/b/text()').to_s.strip,
+        message: node.xpath('blockquote/node()').to_s.strip,
+        img:     node.xpath(XPATH_IMG).to_s.strip,
+
+        id:   txtnode =~ %r!ID:(^\s+)! ? $1.strip : '',
+        ip:   txtnode =~ %r!IP:(^\s+)! ? $1.strip : '',
+
+        date: txtnode =~ %r!(\d+)/(\d+)/(\d+)[^\d]+(\d+):(\d+):(\d+)! \
+          ? Time.mktime($1.to_i < 100 ? $1.to_i + 2000 : $1.to_i, $2, $3, $4, $5, $6) \
+          : Time.mktime(0)
+      )
+    end
+  end
+
+  class Post
+    attr_reader :no, :name, :email, :title, :message, :img, :id, :ip, :date
+
+    def initialize(post = {})
+      @no      = post[:no]
+      @name    = post[:name]
+      @email   = post[:email]
+      @title   = post[:title]
+      @message = post[:message]
+      @img     = post[:img]
+      @id      = post[:id]
+      @ip      = post[:ip]
+      @date    = post[:date]
+    end
+  end
+
+  module URI
+    module_function
+
+    def thread(id)
+      return "/b/res/#{id}.htm"
+    end
+    def catalog
+      return '/b/futaba.php?mode=cat'
+    end
   end
 end
-
-class FutabaThread < Futaba
-  XPATH_IMG = 'a[contains(@href, "/b/src/")][./img]/@href'
-
-  def initialize(server)
-    super
-
-    # Thread ID
-    @thread = nil
-  end
-
-  def parse(str = '', opt = {})
-    noko = getnoko(str)
-
-    thread = [ parse_node(noko.xpath('//form[2]')) ]
-    noko.xpath('//td[@bgcolor="#F0E0D6"][@class="rtd"]').each {|res|
-      thread << parse_node(res)
-    }
-
-    return thread
-  end
-  def parse_thread(id)
-    @thread = id
-    return parse(connect(thread(id)))
-  end
-
-  def getimgs(str = '')
-    return getnoko(str).xpath('//' + XPATH_IMG).to_a
-  end
-
-
-  private
-  def parse_node(node)
-    txtnode = node.xpath('text()').to_s.strip
-
-    return {
-      no:      node.xpath('input[@value="delete"]/@name').to_s.to_i,
-      name:    node.xpath('font[@color="#117743"]/b/text()').to_s.strip,
-      email:   node.xpath('font[@color="#117743"]/b/a[starts-with(@href, "mailto:")]/@href').to_s.strip,
-      title:   node.xpath('font[@color="#cc1105"]/b/text()').to_s.strip,
-      comment: node.xpath('blockquote/node()').to_s.gsub(%r!<br(\s+/)?>!, "\n").strip,
-      img:     node.xpath(XPATH_IMG).to_s.strip,
-
-      id:   txtnode =~ %r!ID:(^\s+)! ? $1.strip : '',
-      ip:   txtnode =~ %r!IP:(^\s+)! ? $1.strip : '',
-
-      date: txtnode =~ %r!(\d+)/(\d+)/(\d+)[^\d]+(\d+):(\d+):(\d+)! \
-             ? Time.mktime($1.to_i < 100 ? $1.to_i + 2000 : $1.to_i, $2, $3, $4, $5, $6) \
-             : Time.mktime(0)
-    }
-  end
-end
-
-#f = FutabaCatalog.new('may')
-#puts f.getthreads({img:nil, text:100})
-
-#f = FutabaThread.new('jun')
-#f.parse_file('./path_to_local.html')
-#p f.parse_thread(19599717)
-#puts f.getimgs
 
