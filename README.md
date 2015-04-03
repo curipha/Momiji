@@ -1,20 +1,8 @@
 Momiji
 ======
-It is kidding itself that it is useful for 2chan users.
-Because it is nothing more than a dream.
+Momiji is a newborn library for 2chan.
 
-About Momiji
-------------
-Just a parser of Futaba-channel.
+## Requirement
 
-...and furthermore, it exhibits immature behavior.
-
-
-### futaba.rb
-Requires Nokogiri.
-It can parse both catalog page and each thread.
-
-### futaba_strscan.rb
-It can be run in vanilla Ruby.
-However, in return for the portability, it can parse a catalog page only.
+- [Nokogiri](http://www.nokogiri.org/)
 
